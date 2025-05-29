@@ -1,95 +1,130 @@
 package com.example.CRUD.repository;
 
-import java.util.stream.Collectors;
-
+import org.springframework.data.elasticsearch.client.elc.ReactiveElasticsearchClient;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import org.springframework.data.redis.core.ReactiveValueOperations;
 import org.springframework.stereotype.Repository;
-import com.example.CRUD.model.Employee;
-import reactor.core.publisher.Mono;
-import co.elastic.clients.elasticsearch.ElasticsearchClient;
-import reactor.core.publisher.Flux;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.server.ResponseStatusException;
+import com.example.CRUD.model.Employee;
+import reactor.core.publisher.Mono;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @Repository
 public class EmployeeRepository {
-    private final ReactiveRedisTemplate<String, Employee> redisTemplate;
+    private static final Logger log = LoggerFactory.getLogger(EmployeeRepository.class);
     private final ReactiveValueOperations<String, Employee> employeeCache;
-    private final ElasticsearchClient elasticsearchClient;
+    private final ReactiveElasticsearchClient client;
 
     public EmployeeRepository(ReactiveRedisTemplate<String, Employee> redisTemplate,
-            ElasticsearchClient elasticsearchClient) {
-        this.redisTemplate = redisTemplate;
+                ReactiveElasticsearchClient client) {
         this.employeeCache = redisTemplate.opsForValue();
-        this.elasticsearchClient = elasticsearchClient;
-    }
-
-    public Mono<Employee> save(Employee employee) {
-        double random = Math.random();
-        Mono<Employee> saveToElastic = Mono.fromCallable(() -> {
-            elasticsearchClient.index(i -> i.index("employees").id(employee.getId()).document(employee));
-            return employee;
-        });
-        if (random > 0.5) {
-            return saveToElastic.flatMap(saved -> employeeCache.set(employee.getId(), employee).thenReturn(employee));
-        } else {
-            return saveToElastic;
-        }
+        this.client = client;
     }
 
     public Mono<Employee> findById(String id) {
         return employeeCache.get(id)
-                .switchIfEmpty(
-                        Mono.fromCallable(() -> {
-                            var response = elasticsearchClient.get(g -> g.index("employees").id(id), Employee.class);
-                            if (!response.found()) {
-                                throw new ResponseStatusException(HttpStatus.NOT_FOUND,
-                                        "Employee not found with ID: " + id);
+                .doOnError(e->log.error("Redis cache error: {}",e.getMessage()))
+                .switchIfEmpty(Mono.from(client.get(req->req.index("employees").id(id),Employee.class))
+                        .flatMap(res->{
+                            Employee employee=res.source();
+                            if(employee==null){
+                                return Mono.error(new ResponseStatusException(HttpStatus.NOT_FOUND, "Not Found: "+ id));
                             }
-                            return response.source();
-                        }).flatMap(emp -> employeeCache.set(id, emp).thenReturn(emp)));
+                            return employeeCache.set(id,employee)
+                                    .doOnError(e->log.warn("Redis cache write error: {}",e.getMessage()))
+                                    .onErrorResume(err->Mono.empty())
+                                    .thenReturn(employee);
+                        })
+                        .doOnError(e->log.error("Elasticsearch error: {}",e.getMessage()))
+                );
+    }
+
+    public Mono<Employee> save(Employee employee) {
+        if (employee.getId() == null || employee.getId().trim().isEmpty()) {
+            return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST, "Employee ID cannot be empty"));
+        }
+        double random = Math.random();
+        Mono<Employee> saveToElasticSearch = client.index(i->i.index("employees").id(employee.getId()).document(employee))
+                .doOnError(e->log.error("Elasticsearch save failed: {}",e.getMessage()))
+                .onErrorMap(e->new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR,"Failed to save employee to elasticSearch",e))
+                .thenReturn(employee);
+        if(random>0.5){
+            return saveToElasticSearch.flatMap(savedEmployee->employeeCache.set(savedEmployee.getId(),savedEmployee)
+                    .doOnError(e->log.warn("Save to Redis failed: {}",e.getMessage())))
+                    .onErrorResume(e->Mono.empty())
+                    .thenReturn(employee);
+        }else{
+            return saveToElasticSearch;
+        }
     }
 
     public Mono<Employee> update(String id, Employee employee) {
-        Employee updatedEmployee = new Employee(id, employee.getName(), employee.getRole(), employee.getDepartment());
-        return Mono.fromCallable(() -> elasticsearchClient.exists(e -> e.index("employees").id(id)).value())
-                .flatMap(exists -> {
-                    if (exists) {
-                        return Mono.fromCallable(() -> {
-                            elasticsearchClient.update(u -> u.index("employees").id(id).doc(updatedEmployee),
-                                    Employee.class);
-                            return updatedEmployee;
-                        }).flatMap(updated -> redisTemplate.delete(id).thenReturn(updated));
-                    } else {
-                        return Mono.error(
-                                new ResponseStatusException(HttpStatus.NOT_FOUND, "Employee not found with ID: " + id));
+        if (id == null || id.isBlank()) {
+            return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST, "Employee ID cannot be empty"));
+        }
+
+        if (employee == null) {
+            return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST, "Employee cannot be null"));
+        }
+
+        Employee updatedEmployee = Employee.builder()
+                .id(id)
+                .name(employee.getName())
+                .role(employee.getRole())
+                .department(employee.getDepartment())
+                .phoneNumber(employee.getPhoneNumber())
+                .build();
+
+        return client.get(req->req.index("employees").id(id),Employee.class)
+                .flatMap(response -> {
+                    if (response.source()==null) {
+                        return Mono.error(new ResponseStatusException(HttpStatus.NOT_FOUND, "Employee not found with ID: " + id));
                     }
-                });
+                    return client.update(u -> u
+                                    .index("employees")
+                                    .id(id)
+                                    .doc(updatedEmployee),
+                            Employee.class
+                    ).flatMap(res -> {
+                        log.info("Employee updated in Elasticsearch: {}", id);
+                        return employeeCache.delete(id)
+                                .doOnError(e -> log.warn("Redis cache delete failed for id {}: {}", id, e.getMessage()))
+                                .onErrorResume(e -> Mono.empty())
+                                .thenReturn(updatedEmployee);
+                    }).onErrorResume(e ->
+                            Mono.error(new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to update employee in Elasticsearch", e))
+                    );
+                }).onErrorResume(e ->
+                        Mono.error((e instanceof ResponseStatusException)
+                                ? e
+                                : new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Unexpected error occurred", e))
+                );
     }
 
     public Mono<Void> deleteById(String id) {
-        return Mono.fromCallable(() -> elasticsearchClient.exists(e -> e.index("employees").id(id)).value())
-                .flatMap(exists -> {
-                    if (!exists) {
-                        return Mono.error(
-                                new ResponseStatusException(HttpStatus.NOT_FOUND, "Employee not found with ID: " + id));
+        if (id == null || id.isBlank()) {
+            return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST, "Employee ID cannot be empty"));
+        }
+        return client.get(req->req.index("employees").id(id),Employee.class)
+                .flatMap(response -> {
+                    if (response.source()==null) {
+                        return Mono.error(new ResponseStatusException(HttpStatus.NOT_FOUND, "Employee not found with ID: " + id));
                     }
-                    return Mono.fromRunnable(() -> {
-                        try {
-                            elasticsearchClient.delete(d -> d.index("employees").id(id));
-                        } catch (Exception e) {
-                            System.out.println("Employee not found with ID: " + id);
-                        }
-                    }).then(redisTemplate.delete(id).then());
+                    return client.delete(req -> req.index("employees").id(id))
+                            .doOnError(e -> log.error("Failed to delete from Elasticsearch for ID {}: {}", id, e.getMessage()))
+                            .onErrorResume(e -> Mono.error(new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to delete employee from Elasticsearch", e)))
+                            .then(employeeCache.delete(id)
+                                    .doOnError(e -> log.warn("Failed to delete from Redis cache for ID {}: {}", id, e.getMessage()))
+                                    .onErrorResume(e -> Mono.empty()))
+                            .then(); // Complete the Mono<Void>
+                }).onErrorResume(e -> {
+                    if (e instanceof ResponseStatusException) {
+                        return Mono.error(e);
+                    }
+                    return Mono.error(new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Unexpected error occurred", e));
                 });
     }
 
-    public Flux<Employee> findAll() {
-        return Mono.fromCallable(() -> {
-            var search = elasticsearchClient.search(s -> s.index("employees").query(q -> q.matchAll(m -> m)),
-                    Employee.class);
-            return search.hits().hits().stream().map(hit -> hit.source()).collect(Collectors.toList());
-        }).flatMapMany(Flux::fromIterable);
-    }
 }

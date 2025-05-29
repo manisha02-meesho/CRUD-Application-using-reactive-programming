@@ -1,11 +1,10 @@
 package com.example.CRUD.service;
 
 import org.springframework.stereotype.Service;
-import org.springframework.beans.factory.annotation.Autowired;
-import com.example.CRUD.repository.EmployeeRepository;
 import com.example.CRUD.model.Employee;
+import com.example.CRUD.repository.EmployeeRepository;
+import org.springframework.beans.factory.annotation.Autowired;
 import reactor.core.publisher.Mono;
-import reactor.core.publisher.Flux;
 
 @Service
 public class EmployeeService {
@@ -32,8 +31,4 @@ public class EmployeeService {
     public Mono<Void> deleteEmployee(String id) {
         return employeeRepository.deleteById(id);
     }
-
-    public Flux<Employee> findAll() {
-        return employeeRepository.findAll();
-    }
-}
+} 

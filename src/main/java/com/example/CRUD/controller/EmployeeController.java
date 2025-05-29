@@ -1,12 +1,10 @@
 package com.example.CRUD.controller;
 
 import org.springframework.web.bind.annotation.*;
+import com.example.CRUD.model.Employee;
 import com.example.CRUD.service.EmployeeService;
-
 import org.springframework.beans.factory.annotation.Autowired;
 import reactor.core.publisher.Mono;
-import reactor.core.publisher.Flux;
-import com.example.CRUD.model.Employee;
 
 @RestController
 @RequestMapping("/api/employees")
@@ -38,9 +36,4 @@ public class EmployeeController {
     public Mono<Void> deleteEmployee(@PathVariable String id) {
         return employeeService.deleteEmployee(id);
     }
-
-    @GetMapping("/all")
-    public Flux<Employee> findAll() {
-        return employeeService.findAll();
-    }
-}
+} 
