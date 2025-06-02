@@ -26,7 +26,11 @@ public class EmployeeRepository {
     public Mono<Employee> findById(String id) {
         return employeeCache.get(id)
                 .doOnError(e->log.error("Redis cache error: {}",e.getMessage()))
-                .switchIfEmpty(Mono.from(client.get(req->req.index("employees").id(id),Employee.class))
+                .onErrorResume(err->Mono.empty())
+                .switchIfEmpty(Mono.defer(()->{
+                    var result=client.get(req->req.index("employees").id(id),Employee.class);
+                    return result==null?Mono.error(new IllegalStateException("client.get() return null")):Mono.from(result);
+                                })
                         .flatMap(res->{
                             Employee employee=res.source();
                             if(employee==null){
@@ -52,9 +56,10 @@ public class EmployeeRepository {
                 .thenReturn(employee);
         if(random>0.5){
             return saveToElasticSearch.flatMap(savedEmployee->employeeCache.set(savedEmployee.getId(),savedEmployee)
-                    .doOnError(e->log.warn("Save to Redis failed: {}",e.getMessage())))
+                    .doOnError(e->log.warn("Save to Redis failed: {}",e.getMessage()))
                     .onErrorResume(e->Mono.empty())
-                    .thenReturn(employee);
+                    .thenReturn(employee)
+            );
         }else{
             return saveToElasticSearch;
         }
@@ -107,24 +112,33 @@ public class EmployeeRepository {
         if (id == null || id.isBlank()) {
             return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST, "Employee ID cannot be empty"));
         }
-        return client.get(req->req.index("employees").id(id),Employee.class)
+
+        return client.get(req -> req.index("employees").id(id), Employee.class)
                 .flatMap(response -> {
-                    if (response.source()==null) {
+                    if (response.source() == null) {
                         return Mono.error(new ResponseStatusException(HttpStatus.NOT_FOUND, "Employee not found with ID: " + id));
                     }
+
                     return client.delete(req -> req.index("employees").id(id))
                             .doOnError(e -> log.error("Failed to delete from Elasticsearch for ID {}: {}", id, e.getMessage()))
-                            .onErrorResume(e -> Mono.error(new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to delete employee from Elasticsearch", e)))
-                            .then(employeeCache.delete(id)
-                                    .doOnError(e -> log.warn("Failed to delete from Redis cache for ID {}: {}", id, e.getMessage()))
-                                    .onErrorResume(e -> Mono.empty()))
-                            .then(); // Complete the Mono<Void>
-                }).onErrorResume(e -> {
+                            .onErrorMap(e -> new ResponseStatusException(
+                                    HttpStatus.INTERNAL_SERVER_ERROR, "Failed to delete employee from Elasticsearch", e))
+                            .then(Mono.defer(() ->
+                                    employeeCache.delete(id)
+                                            .doOnError(e -> log.error("Redis cache delete failed for ID {}: {}", id, e.getMessage()))
+                                            .onErrorMap(e -> new ResponseStatusException(
+                                                    HttpStatus.INTERNAL_SERVER_ERROR,
+                                                    "Failed to delete employee from Redis cache", e
+                                            ))
+                                            .then()
+                            ));
+                })
+                .onErrorResume(e -> {
                     if (e instanceof ResponseStatusException) {
                         return Mono.error(e);
                     }
-                    return Mono.error(new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Unexpected error occurred", e));
+                    return Mono.error(new ResponseStatusException(
+                            HttpStatus.INTERNAL_SERVER_ERROR, "Unexpected error occurred", e));
                 });
     }
-
 }
