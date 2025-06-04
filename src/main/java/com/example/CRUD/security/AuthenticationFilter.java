@@ -9,11 +9,10 @@ import org.springframework.web.server.WebFilterChain;
 import reactor.core.publisher.Mono;
 
 @Component
-public class authFilter implements WebFilter {
+public class AuthenticationFilter implements WebFilter {
 
     @Value("${auth.token}")
     private String authToken;
-
 
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
